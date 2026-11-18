@@ -1,10 +1,23 @@
 import { useEffect, useRef, useState } from "react";
 import { supabase } from "../services/supabaseClient";
 
-const announcementColumns =
-  "id, title, message, is_published, created_at";
+const columns = "id, title, message, is_published, created_at, created_by";
+
+const actionsStyle = {
+  display: "flex",
+  flexWrap: "wrap",
+  gap: "10px",
+  marginTop: "12px",
+};
 
 export default function AdminAnnouncements({ userId }) {
+  if (!userId) return <p>Please sign in.</p>;
+
+  // Start with fresh permissions and form data if the account changes.
+  return <AnnouncementManager key={userId} userId={userId} />;
+}
+
+function AnnouncementManager({ userId }) {
   const [announcements, setAnnouncements] = useState([]);
   const [isAdmin, setIsAdmin] = useState(false);
   const [loading, setLoading] = useState(true);
@@ -26,18 +39,13 @@ export default function AdminAnnouncements({ userId }) {
   useEffect(() => {
     let active = true;
 
-    async function loadData() {
+    async function loadAnnouncements() {
       try {
-        if (!userId) {
-          throw new Error("Please sign in.");
-        }
-
-        const { data: membership, error: membershipError } =
-          await supabase
-            .from("admin_users")
-            .select("user_id")
-            .eq("user_id", userId)
-            .maybeSingle();
+        const { data: membership, error: membershipError } = await supabase
+          .from("admin_users")
+          .select("user_id")
+          .eq("user_id", userId)
+          .maybeSingle();
 
         if (membershipError) throw membershipError;
         if (!active || !membership) return;
@@ -46,7 +54,7 @@ export default function AdminAnnouncements({ userId }) {
 
         const { data, error } = await supabase
           .from("announcements")
-          .select(announcementColumns)
+          .select(columns)
           .order("created_at", { ascending: false })
           .limit(50);
 
@@ -54,22 +62,17 @@ export default function AdminAnnouncements({ userId }) {
 
         if (error) {
           setListError(error.message);
-          return;
+        } else {
+          setAnnouncements(data ?? []);
         }
-
-        setAnnouncements(data ?? []);
       } catch (error) {
-        if (active) {
-          setAccessError(error.message);
-        }
+        if (active) setAccessError(error.message);
       } finally {
-        if (active) {
-          setLoading(false);
-        }
+        if (active) setLoading(false);
       }
     }
 
-    loadData();
+    loadAnnouncements();
 
     return () => {
       active = false;
@@ -83,162 +86,151 @@ export default function AdminAnnouncements({ userId }) {
     setVisibility("draft");
   }
 
-  function startEditing(announcement) {
+  function startEditing(notice) {
     if (requestInProgress.current) return;
 
-    setEditingId(announcement.id);
-    setTitle(announcement.title);
-    setBody(announcement.message);
-    setVisibility(
-      announcement.is_published ? "published" : "draft"
-    );
+    setEditingId(notice.id);
+    setTitle(notice.title);
+    setBody(notice.message);
+    setVisibility(notice.is_published ? "published" : "draft");
     setMessage("");
-
-    formRef.current?.scrollIntoView({
-      behavior: "smooth",
-      block: "start",
-    });
+    formRef.current?.scrollIntoView({ behavior: "smooth", block: "start" });
   }
 
   function cancelEditing() {
     if (requestInProgress.current) return;
-
     resetForm();
     setMessage("");
+  }
+
+  async function runAction(action) {
+    if (!isAdmin || requestInProgress.current) return;
+
+    requestInProgress.current = true;
+    setBusy(true);
+    setMessage("");
+
+    try {
+      await action();
+    } catch (error) {
+      setMessage(`Action failed: ${error.message}`);
+    } finally {
+      requestInProgress.current = false;
+      setBusy(false);
+    }
+  }
+
+  function replaceNotice(updated) {
+    setAnnouncements((previous) =>
+      previous.map((notice) => (notice.id === updated.id ? updated : notice))
+    );
   }
 
   async function handleSubmit(event) {
     event.preventDefault();
 
-    if (!isAdmin || requestInProgress.current) return;
-
     const cleanTitle = title.trim();
     const cleanBody = body.trim();
 
-    if (
-      cleanTitle.length === 0 ||
-      cleanTitle.length > 150 ||
-      cleanBody.length === 0 ||
-      cleanBody.length > 3000
-    ) {
-      setMessage(
-        "Enter a title of 1–150 characters and announcement text of 1–3000 characters."
-      );
+    if (!cleanTitle || cleanTitle.length > 150 ||
+        !cleanBody || cleanBody.length > 3000) {
+      setMessage("Enter a title of 1–150 characters and a message of 1–3000 characters.");
       return;
     }
 
-    const idToEdit = editingId;
-    const published = visibility === "published";
-
-    requestInProgress.current = true;
-    setBusy(true);
-    setMessage("");
-
-    try {
+    await runAction(async () => {
       const values = {
         title: cleanTitle,
         message: cleanBody,
-        is_published: published,
+        is_published: visibility === "published",
       };
 
-      const query =
-        idToEdit !== null
-          ? supabase
-            .from("announcements")
-            .update(values)
-            .eq("id", idToEdit)
-          : supabase.from("announcements").insert(values);
+      const table = supabase.from("announcements");
+      const query = editingId === null
+        ? table.insert(values)
+        : table.update(values).eq("id", editingId);
 
-      const { data, error } = await query
-        .select(announcementColumns)
-        .single();
-
+      const { data, error } = await query.select(columns).single();
       if (error) throw error;
 
-      setAnnouncements((previous) =>
-        idToEdit !== null
-          ? previous.map((announcement) =>
-            announcement.id === data.id ? data : announcement
-          )
-          : [data, ...previous]
-      );
+      if (editingId === null) {
+        setAnnouncements((previous) => [data, ...previous]);
+      } else {
+        replaceNotice(data);
+      }
 
       resetForm();
-
       setMessage(
-        published
-          ? "Announcement saved and published to students."
+        data.is_published
+          ? "Announcement published to students."
           : "Draft saved. It is hidden from students."
       );
-    } catch (error) {
-      setMessage(`Could not save: ${error.message}`);
-    } finally {
-      requestInProgress.current = false;
-      setBusy(false);
-    }
+    });
   }
 
-  async function changeVisibility(announcement) {
-    if (
-      !isAdmin ||
-      requestInProgress.current ||
-      editingId !== null
-    ) {
-      return;
-    }
+  async function changeVisibility(notice) {
+    if (editingId !== null) return;
 
-    requestInProgress.current = true;
-    setBusy(true);
-    setMessage("");
-
-    try {
+    await runAction(async () => {
       const { data, error } = await supabase
         .from("announcements")
-        .update({
-          is_published: !announcement.is_published,
-        })
-        .eq("id", announcement.id)
-        .select(announcementColumns)
+        .update({ is_published: !notice.is_published })
+        .eq("id", notice.id)
+        .select(columns)
         .single();
 
       if (error) throw error;
 
-      setAnnouncements((previous) =>
-        previous.map((item) =>
-          item.id === data.id ? data : item
-        )
-      );
-
+      replaceNotice(data);
       setMessage(
         data.is_published
           ? "Announcement published to students."
           : "Announcement unpublished and saved as a draft."
       );
-    } catch (error) {
-      setMessage(`Could not change visibility: ${error.message}`);
-    } finally {
-      requestInProgress.current = false;
-      setBusy(false);
-    }
+    });
   }
 
-  const visibleAnnouncements = announcements.filter(
-    (announcement) => {
-      if (filter === "published") {
-        return announcement.is_published;
-      }
-
-      if (filter === "draft") {
-        return !announcement.is_published;
-      }
-
-      return true;
+  async function deleteAnnouncement(notice) {
+    if (
+      !isAdmin ||
+      notice.created_by !== userId ||
+      editingId !== null ||
+      requestInProgress.current
+    ) {
+      return;
     }
-  );
 
-  if (loading) {
-    return <p>Loading announcement management...</p>;
+    const confirmed = window.confirm(
+      `Permanently delete "${notice.title}"? This cannot be undone.`
+    );
+
+    if (!confirmed) return;
+
+    await runAction(async () => {
+      const { data, error } = await supabase
+        .from("announcements")
+        .delete()
+        .eq("id", notice.id)
+        .eq("created_by", userId)
+        .select("id")
+        .maybeSingle();
+
+      if (error) throw error;
+
+      // Only remove the card after Supabase confirms it deleted the row.
+      if (!data) {
+        setMessage("Nothing was deleted. Refresh to check this announcement.");
+        return;
+      }
+
+      setAnnouncements((previous) =>
+        previous.filter((item) => item.id !== data.id)
+      );
+      setMessage(`Deleted "${notice.title}".`);
+    });
   }
+
+  if (loading) return <p>Loading announcement management...</p>;
 
   if (!isAdmin) {
     return (
@@ -248,25 +240,21 @@ export default function AdminAnnouncements({ userId }) {
     );
   }
 
+  const visibleAnnouncements = announcements.filter((notice) => {
+    if (filter === "published") return notice.is_published;
+    if (filter === "draft") return !notice.is_published;
+    return true;
+  });
+
   return (
     <section>
       <h2>Manage Announcements</h2>
-      <p>
-        Create notices, edit their content, and control whether
-        students can see them.
-      </p>
+      <p>Create, edit, and publish campus notices. You can delete your own notices.</p>
 
       <form ref={formRef} onSubmit={handleSubmit}>
-        <h3>
-          {editingId !== null
-            ? "Edit announcement"
-            : "Create announcement"}
-        </h3>
+        <h3>{editingId === null ? "Create announcement" : "Edit announcement"}</h3>
 
-        <fieldset
-          disabled={busy}
-          style={{ border: 0, padding: 0, margin: 0 }}
-        >
+        <fieldset disabled={busy} style={{ border: 0, padding: 0, margin: 0 }}>
           <label htmlFor="notice-title">Title</label>
           <input
             id="notice-title"
@@ -296,22 +284,13 @@ export default function AdminAnnouncements({ userId }) {
             <option value="published">Publish to students</option>
           </select>
 
-          <div
-            style={{
-              display: "flex",
-              gap: "10px",
-              flexWrap: "wrap",
-              marginTop: "12px",
-            }}
-          >
+          <div style={actionsStyle}>
             <button type="submit">
-              {busy
-                ? "Saving..."
-                : editingId !== null
-                  ? "Save changes"
-                  : visibility === "published"
-                    ? "Publish announcement"
-                    : "Save draft"}
+              {editingId !== null
+                ? "Save changes"
+                : visibility === "published"
+                  ? "Publish announcement"
+                  : "Save draft"}
             </button>
 
             {editingId !== null && (
@@ -325,21 +304,11 @@ export default function AdminAnnouncements({ userId }) {
 
       {message && <p role="status">{message}</p>}
 
-      <h3 style={{ marginTop: "28px" }}>
-        Existing announcements
-      </h3>
-
-      <p>
-        Loads the latest 50 announcements, plus notices created
-        in this session. Filters apply to loaded records.
-      </p>
+      <h3 style={{ marginTop: "28px" }}>Existing announcements</h3>
+      <p>Showing the latest 50 notices, plus any added in this session.</p>
 
       {listError && (
-        <p role="alert">
-          Could not load the existing announcements: {listError}.
-          Refresh the page to retry after saving any draft you
-          are typing.
-        </p>
+        <p role="alert">Could not load announcements: {listError}</p>
       )}
 
       <label htmlFor="notice-filter">Filter by visibility</label>
@@ -354,81 +323,60 @@ export default function AdminAnnouncements({ userId }) {
       </select>
 
       <p role="status">
-        Showing {visibleAnnouncements.length} of{" "}
-        {announcements.length} loaded announcements.
+        Showing {visibleAnnouncements.length} of {announcements.length} loaded announcements.
       </p>
 
       {editingId !== null && (
+        <p>Save or cancel your edit before changing another announcement.</p>
+      )}
+
+      {!listError && visibleAnnouncements.length === 0 && (
         <p>
-          Save or cancel your current edit before changing another
-          announcement.
+          {announcements.length === 0
+            ? "No announcements have been created yet."
+            : "No announcements match this filter."}
         </p>
       )}
 
-      {visibleAnnouncements.length === 0 ? (
-        !listError && (
+      {visibleAnnouncements.map((notice) => (
+        <article key={notice.id} className="report-item">
+          <h4>{notice.title}</h4>
+          <p style={{ whiteSpace: "pre-wrap" }}>{notice.message}</p>
           <p>
-            {announcements.length === 0
-              ? "No announcements have been created yet."
-              : "No loaded announcements match this filter."}
+            Visibility: <strong>{notice.is_published ? "Published" : "Draft"}</strong>
           </p>
-        )
-      ) : (
-        visibleAnnouncements.map((announcement) => (
-          <article
-            className="report-item"
-            key={announcement.id}
-          >
-            <h4>{announcement.title}</h4>
+          <p>Created: {new Date(notice.created_at).toLocaleString()}</p>
 
-            <p style={{ whiteSpace: "pre-wrap" }}>
-              {announcement.message}
-            </p>
-
-            <p>
-              Visibility:{" "}
-              <strong>
-                {announcement.is_published ? "Published" : "Draft"}
-              </strong>
-            </p>
-
-            <p>
-              Created:{" "}
-              {new Date(
-                announcement.created_at
-              ).toLocaleString()}
-            </p>
-
-            <div
-              style={{
-                display: "flex",
-                gap: "10px",
-                flexWrap: "wrap",
-              }}
+          <div style={actionsStyle}>
+            <button
+              type="button"
+              disabled={busy || editingId !== null}
+              onClick={() => startEditing(notice)}
             >
-              <button
-                type="button"
-                disabled={busy || editingId !== null}
-                onClick={() => startEditing(announcement)}
-              >
-                {editingId === announcement.id
-                  ? "Currently editing"
-                  : "Edit announcement"}
-              </button>
+              {editingId === notice.id ? "Currently editing" : "Edit announcement"}
+            </button>
 
+            <button
+              type="button"
+              disabled={busy || editingId !== null}
+              onClick={() => changeVisibility(notice)}
+            >
+              {notice.is_published ? "Unpublish" : "Publish"}
+            </button>
+
+            {notice.created_by === userId && (
               <button
                 type="button"
                 disabled={busy || editingId !== null}
-                onClick={() => changeVisibility(announcement)}
+                aria-label={`Delete announcement: ${notice.title}`}
+                onClick={() => deleteAnnouncement(notice)}
               >
-                {announcement.is_published
-                  ? "Unpublish"
-                  : "Publish"}
+                Delete
               </button>
-            </div>
-          </article>
-        ))
-      )}
+            )}
+          </div>
+        </article>
+      ))}
     </section>
   );
 }
