@@ -2,13 +2,20 @@ import { useEffect, useRef, useState } from "react";
 import { supabase } from "../services/supabaseClient";
 
 const eventColumns =
-  "id, title, description, venue, starts_at, ends_at, is_published";
+  "id, title, description, venue, starts_at, ends_at, is_published, created_by";
 
 const dateFormatter = new Intl.DateTimeFormat("en-IN", {
   dateStyle: "medium",
   timeStyle: "short",
   timeZone: "Asia/Kolkata",
 });
+
+const actionsStyle = {
+  display: "flex",
+  flexWrap: "wrap",
+  gap: "10px",
+  marginTop: "12px",
+};
 
 function emptyForm() {
   return {
@@ -21,31 +28,34 @@ function emptyForm() {
   };
 }
 
-// Convert a stored timestamp to an IST datetime-local input value.
+// A datetime-local input has no timezone. Show campus time even if
+// the admin opens the form from a computer outside India.
 function toISTInput(value) {
   if (!value) return "";
 
-  const date = new Date(value);
-  if (!Number.isFinite(date.getTime())) return "";
+  const time = new Date(value).getTime();
+  if (!Number.isFinite(time)) return "";
 
-  const istOffsetMilliseconds = 330 * 60 * 1000;
-
-  return new Date(date.getTime() + istOffsetMilliseconds)
-    .toISOString()
-    .slice(0, 16);
+  return new Date(time + 330 * 60 * 1000).toISOString().slice(0, 16);
 }
 
 function displayDate(value) {
   if (!value) return "Not specified";
 
   const date = new Date(value);
-
   return Number.isFinite(date.getTime())
-    ? dateFormatter.format(date)
+    ? `${dateFormatter.format(date)} IST`
     : "Invalid date";
 }
 
 export default function AdminEvents({ userId }) {
+  if (!userId) return <p>Please sign in.</p>;
+
+  // Reset the form and permissions if the signed-in account changes.
+  return <EventManager key={userId} userId={userId} />;
+}
+
+function EventManager({ userId }) {
   const [events, setEvents] = useState([]);
   const [isAdmin, setIsAdmin] = useState(false);
   const [loading, setLoading] = useState(true);
@@ -64,16 +74,13 @@ export default function AdminEvents({ userId }) {
   useEffect(() => {
     let active = true;
 
-    async function loadData() {
+    async function loadEvents() {
       try {
-        if (!userId) throw new Error("Please sign in.");
-
-        const { data: membership, error: membershipError } =
-          await supabase
-            .from("admin_users")
-            .select("user_id")
-            .eq("user_id", userId)
-            .maybeSingle();
+        const { data: membership, error: membershipError } = await supabase
+          .from("admin_users")
+          .select("user_id")
+          .eq("user_id", userId)
+          .maybeSingle();
 
         if (membershipError) throw membershipError;
         if (!active || !membership) return;
@@ -90,10 +97,9 @@ export default function AdminEvents({ userId }) {
 
         if (error) {
           setListError(error.message);
-          return;
+        } else {
+          setEvents(data ?? []);
         }
-
-        setEvents(data ?? []);
       } catch (error) {
         if (active) setAccessError(error.message);
       } finally {
@@ -101,7 +107,7 @@ export default function AdminEvents({ userId }) {
       }
     }
 
-    loadData();
+    loadEvents();
 
     return () => {
       active = false;
@@ -110,11 +116,7 @@ export default function AdminEvents({ userId }) {
 
   function updateField(event) {
     const { name, value } = event.target;
-
-    setForm((previous) => ({
-      ...previous,
-      [name]: value,
-    }));
+    setForm((previous) => ({ ...previous, [name]: value }));
   }
 
   function resetForm() {
@@ -122,168 +124,172 @@ export default function AdminEvents({ userId }) {
     setForm(emptyForm());
   }
 
-  function startEditing(event) {
+  function startEditing(item) {
     if (requestInProgress.current) return;
 
-    setEditingId(event.id);
+    setEditingId(item.id);
     setForm({
-      title: event.title ?? "",
-      description: event.description ?? "",
-      venue: event.venue ?? "",
-      startsAt: toISTInput(event.starts_at),
-      endsAt: toISTInput(event.ends_at),
-      visibility: event.is_published ? "published" : "draft",
+      title: item.title ?? "",
+      description: item.description ?? "",
+      venue: item.venue ?? "",
+      startsAt: toISTInput(item.starts_at),
+      endsAt: toISTInput(item.ends_at),
+      visibility: item.is_published ? "published" : "draft",
     });
-    setMessage("");
 
-    formRef.current?.scrollIntoView({
-      behavior: "smooth",
-      block: "start",
-    });
+    setMessage("");
+    formRef.current?.scrollIntoView({ behavior: "smooth", block: "start" });
   }
 
-  function cancelEditing() {
-    if (requestInProgress.current) return;
+  function replaceEvent(updated) {
+    setEvents((previous) =>
+      previous.map((item) => (item.id === updated.id ? updated : item))
+    );
+  }
 
-    resetForm();
+  async function runAction(action) {
+    if (!isAdmin || requestInProgress.current) return;
+
+    requestInProgress.current = true;
+    setBusy(true);
     setMessage("");
+
+    try {
+      await action();
+    } catch (error) {
+      setMessage(`Action failed: ${error.message}`);
+    } finally {
+      requestInProgress.current = false;
+      setBusy(false);
+    }
   }
 
   async function saveEvent(event) {
     event.preventDefault();
 
-    if (!isAdmin || requestInProgress.current) return;
-
     const title = form.title.trim();
-    const description = form.description.trim();
     const venue = form.venue.trim();
+    const description = form.description.trim();
 
-    if (!title || title.length > 150 || !venue) {
+    if (!title || !venue) {
       setMessage("Enter an event title and venue.");
       return;
     }
 
     if (!form.startsAt || !form.endsAt) {
-      setMessage("Enter the starting and ending dates and times.");
+      setMessage("Enter both the start and end times.");
       return;
     }
 
-    // Explicit IST offset prevents browser timezone differences.
-    const startDate = new Date(`${form.startsAt}:00+05:30`);
-    const endDate = new Date(`${form.endsAt}:00+05:30`);
+    const start = new Date(`${form.startsAt}+05:30`);
+    const end = new Date(`${form.endsAt}+05:30`);
 
-    if (
-      !Number.isFinite(startDate.getTime()) ||
-      !Number.isFinite(endDate.getTime())
-    ) {
-      setMessage("Enter valid dates and times.");
+    if (!Number.isFinite(start.getTime()) || !Number.isFinite(end.getTime())) {
+      setMessage("Enter valid start and end times.");
       return;
     }
 
-    if (endDate <= startDate) {
-      setMessage("The ending time must be after the starting time.");
+    if (end <= start) {
+      setMessage("The event must end after it starts.");
       return;
     }
 
-    const idToEdit = editingId;
-
-    requestInProgress.current = true;
-    setBusy(true);
-    setMessage("");
-
-    try {
+    await runAction(async () => {
       const values = {
         title,
         description,
         venue,
-        starts_at: startDate.toISOString(),
-        ends_at: endDate.toISOString(),
+        starts_at: start.toISOString(),
+        ends_at: end.toISOString(),
         is_published: form.visibility === "published",
       };
 
-      const query =
-        idToEdit !== null
-          ? supabase.from("events").update(values).eq("id", idToEdit)
-          : supabase.from("events").insert(values);
+      const table = supabase.from("events");
+      const query = editingId === null
+        ? table.insert(values)
+        : table.update(values).eq("id", editingId);
 
-      const { data, error } = await query
+      const { data, error } = await query.select(eventColumns).single();
+      if (error) throw error;
+
+      if (editingId === null) {
+        setEvents((previous) => [data, ...previous]);
+      } else {
+        replaceEvent(data);
+      }
+
+      resetForm();
+      setMessage(
+        data.is_published
+          ? "Event published. Future events appear in Upcoming Events."
+          : "Draft saved. Students cannot see it."
+      );
+    });
+  }
+
+  async function changeVisibility(item) {
+    if (editingId !== null) return;
+
+    await runAction(async () => {
+      const { data, error } = await supabase
+        .from("events")
+        .update({ is_published: !item.is_published })
+        .eq("id", item.id)
         .select(eventColumns)
         .single();
 
       if (error) throw error;
 
-      setEvents((previous) =>
-        idToEdit !== null
-          ? previous.map((item) => (item.id === data.id ? data : item))
-          : [data, ...previous]
-      );
-
-      resetForm();
-
+      replaceEvent(data);
       setMessage(
         data.is_published
-          ? "Event saved as published. It appears in Upcoming Events if its start time is still in the future."
-          : "Event saved as a draft. Students cannot see it."
+          ? "Event published. Future events appear in Upcoming Events."
+          : "Event unpublished and saved as a draft."
       );
-    } catch (error) {
-      setMessage(`Could not save event: ${error.message}`);
-    } finally {
-      requestInProgress.current = false;
-      setBusy(false);
-    }
+    });
   }
 
-  async function changeVisibility(event) {
+  async function deleteEvent(item) {
     if (
       !isAdmin ||
-      requestInProgress.current ||
-      editingId !== null
+      item.created_by !== userId ||
+      editingId !== null ||
+      requestInProgress.current
     ) {
       return;
     }
 
-    requestInProgress.current = true;
-    setBusy(true);
-    setMessage("");
+    const confirmed = window.confirm(
+      `Permanently delete "${item.title}"?\n\n` +
+      `${displayDate(item.starts_at)} · ${item.venue}\n\n` +
+      "This cannot be undone."
+    );
 
-    try {
+    if (!confirmed) return;
+
+    await runAction(async () => {
       const { data, error } = await supabase
         .from("events")
-        .update({ is_published: !event.is_published })
-        .eq("id", event.id)
-        .select(eventColumns)
-        .single();
+        .delete()
+        .eq("id", item.id)
+        .eq("created_by", userId)
+        .select("id")
+        .maybeSingle();
 
       if (error) throw error;
 
-      setEvents((previous) =>
-        previous.map((item) => (item.id === data.id ? data : item))
-      );
+      if (!data) {
+        setMessage("Nothing was deleted. Refresh to check this event.");
+        return;
+      }
 
-      setMessage(
-        data.is_published
-          ? "Event published. Upcoming Events shows only events whose start time is still in the future."
-          : "Event unpublished and saved as a draft."
-      );
-    } catch (error) {
-      setMessage(`Could not change visibility: ${error.message}`);
-    } finally {
-      requestInProgress.current = false;
-      setBusy(false);
-    }
+      // Remove the card only after the database confirms the deletion.
+      setEvents((previous) => previous.filter((event) => event.id !== data.id));
+      setMessage(`Deleted "${item.title}".`);
+    });
   }
 
-  const visibleEvents = events
-    .filter((event) => {
-      if (filter === "published") return event.is_published;
-      if (filter === "draft") return !event.is_published;
-      return true;
-    })
-    .sort((a, b) => new Date(b.starts_at) - new Date(a.starts_at));
-
-  if (loading) {
-    return <p>Loading event management...</p>;
-  }
+  if (loading) return <p>Loading event management...</p>;
 
   if (!isAdmin) {
     return (
@@ -293,21 +299,25 @@ export default function AdminEvents({ userId }) {
     );
   }
 
+  const visibleEvents = events
+    .filter((item) => {
+      if (filter === "published") return item.is_published;
+      if (filter === "draft") return !item.is_published;
+      return true;
+    })
+    .sort((a, b) => Date.parse(b.starts_at) - Date.parse(a.starts_at));
+
+  const actionsDisabled = busy || editingId !== null;
+
   return (
     <section>
       <h2>Manage Events</h2>
-      <p>
-        Create and edit college events. Enter all dates and times
-        in India Standard Time (IST).
-      </p>
+      <p>Enter dates and times in India Standard Time (IST).</p>
 
       <form ref={formRef} onSubmit={saveEvent}>
-        <h3>{editingId !== null ? "Edit event" : "Create event"}</h3>
+        <h3>{editingId === null ? "Create event" : "Edit event"}</h3>
 
-        <fieldset
-          disabled={busy}
-          style={{ border: 0, padding: 0, margin: 0 }}
-        >
+        <fieldset disabled={busy} style={{ border: 0, padding: 0, margin: 0 }}>
           <label htmlFor="event-title">Event title</label>
           <input
             id="event-title"
@@ -334,7 +344,6 @@ export default function AdminEvents({ userId }) {
             name="venue"
             value={form.venue}
             onChange={updateField}
-            placeholder="Enter the actual building or venue"
             maxLength={200}
             required
           />
@@ -372,26 +381,23 @@ export default function AdminEvents({ userId }) {
             <option value="published">Publish to students</option>
           </select>
 
-          <div
-            style={{
-              display: "flex",
-              gap: "10px",
-              flexWrap: "wrap",
-              marginTop: "12px",
-            }}
-          >
+          <div style={actionsStyle}>
             <button type="submit">
-              {busy
-                ? "Saving..."
-                : editingId !== null
-                  ? "Save changes"
-                  : form.visibility === "published"
-                    ? "Publish event"
-                    : "Save draft"}
+              {editingId !== null
+                ? "Save changes"
+                : form.visibility === "published"
+                  ? "Publish event"
+                  : "Save draft"}
             </button>
 
             {editingId !== null && (
-              <button type="button" onClick={cancelEditing}>
+              <button
+                type="button"
+                onClick={() => {
+                  resetForm();
+                  setMessage("");
+                }}
+              >
                 Cancel editing
               </button>
             )}
@@ -402,17 +408,9 @@ export default function AdminEvents({ userId }) {
       {message && <p role="status">{message}</p>}
 
       <h3 style={{ marginTop: "28px" }}>Existing events</h3>
-      <p>
-        Loads up to 100 events ordered by starting date, latest first,
-        plus events added in this session.
-      </p>
+      <p>Loads up to 100 events, latest start date first, plus events added here.</p>
 
-      {listError && (
-        <p role="alert">
-          Could not load events: {listError}. Refresh after saving
-          any draft you are typing.
-        </p>
-      )}
+      {listError && <p role="alert">Could not load events: {listError}</p>}
 
       <label htmlFor="event-filter">Filter by visibility</label>
       <select
@@ -430,64 +428,56 @@ export default function AdminEvents({ userId }) {
       </p>
 
       {editingId !== null && (
-        <p>
-          Save or cancel your current edit before changing another event.
-        </p>
+        <p>Save or cancel your edit before changing another event.</p>
       )}
 
-      {visibleEvents.length === 0 ? (
-        !listError && <p>No loaded events match this filter.</p>
-      ) : (
-        <div className="events-grid">
-          {visibleEvents.map((event) => (
-            <article className="event-item" key={event.id}>
-              <h4>{event.title}</h4>
+      {!listError && visibleEvents.length === 0 && (
+        <p>No events match this filter.</p>
+      )}
 
-              <p style={{ whiteSpace: "pre-wrap" }}>
-                {event.description}
-              </p>
+      <div className="events-grid">
+        {visibleEvents.map((item) => (
+          <article className="event-item" key={item.id}>
+            <h4>{item.title}</h4>
+            <p style={{ whiteSpace: "pre-wrap" }}>{item.description}</p>
+            <p><strong>Venue:</strong> {item.venue}</p>
+            <p><strong>Starts:</strong> {displayDate(item.starts_at)}</p>
+            <p><strong>Ends:</strong> {displayDate(item.ends_at)}</p>
+            <p>
+              <strong>Visibility:</strong> {item.is_published ? "Published" : "Draft"}
+            </p>
 
-              <p>
-                <strong>Venue:</strong> {event.venue}
-              </p>
-              <p>
-                <strong>Starts:</strong> {displayDate(event.starts_at)} IST
-              </p>
-              <p>
-                <strong>Ends:</strong> {displayDate(event.ends_at)} IST
-              </p>
-              <p>
-                <strong>Visibility:</strong>{" "}
-                {event.is_published ? "Published" : "Draft"}
-              </p>
-
-              <div
-                style={{
-                  display: "flex",
-                  gap: "10px",
-                  flexWrap: "wrap",
-                }}
+            <div style={actionsStyle}>
+              <button
+                type="button"
+                disabled={actionsDisabled}
+                onClick={() => startEditing(item)}
               >
-                <button
-                  type="button"
-                  disabled={busy || editingId !== null}
-                  onClick={() => startEditing(event)}
-                >
-                  {editingId === event.id ? "Currently editing" : "Edit event"}
-                </button>
+                {editingId === item.id ? "Currently editing" : "Edit event"}
+              </button>
 
+              <button
+                type="button"
+                disabled={actionsDisabled}
+                onClick={() => changeVisibility(item)}
+              >
+                {item.is_published ? "Unpublish" : "Publish"}
+              </button>
+
+              {item.created_by === userId && (
                 <button
                   type="button"
-                  disabled={busy || editingId !== null}
-                  onClick={() => changeVisibility(event)}
+                  disabled={actionsDisabled}
+                  aria-label={`Delete event: ${item.title}`}
+                  onClick={() => deleteEvent(item)}
                 >
-                  {event.is_published ? "Unpublish" : "Publish"}
+                  Delete
                 </button>
-              </div>
-            </article>
-          ))}
-        </div>
-      )}
+              )}
+            </div>
+          </article>
+        ))}
+      </div>
     </section>
   );
 }
